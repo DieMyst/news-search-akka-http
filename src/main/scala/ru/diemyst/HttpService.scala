@@ -5,7 +5,8 @@ import akka.event.Logging
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
 import akka.http.scaladsl.model.HttpMethods._
-import akka.http.scaladsl.model.{HttpRequest, StatusCodes, Uri}
+import akka.http.scaladsl.model._
+import akka.http.scaladsl.model.headers.Accept
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.server.Route
 import akka.http.scaladsl.unmarshalling.Unmarshal
@@ -24,12 +25,27 @@ import spray.json.DefaultJsonProtocol
  */
 case class Request(news: List[Query])
 case class Query(query: String, n: Int)
-case class Response(date: String, result: Seq[References])
+
+case class GoogleResponse(responseData: Option[ResponseData], responseDetails: Option[String], responseStatus: Int)
+case class ResponseData(results: List[Results], cursor: Cursor)
+case class Results(unescapedUrl: Option[String], relatedStories: Option[List[RelatedStories]])
+case class RelatedStories(unescapedUrl: Option[String])
+case class Cursor(pages: List[Pages], currentPageIndex: Int)
+case class Pages(start: String, label: Int)
+
+case class Response(date: String, result: List[References])
 case class References(site: String, n: Int)
 
-object Protocols extends DefaultJsonProtocol with SprayJsonSupport{
+object Protocols extends DefaultJsonProtocol with SprayJsonSupport {
   implicit def queryFormat = jsonFormat2(Query.apply)
   implicit def newsFormat = jsonFormat1(Request.apply)
+
+  implicit def pagesFormat = jsonFormat2(Pages.apply)
+  implicit def cursorFormat = jsonFormat2(Cursor.apply)
+  implicit def relatedStoriesFormat = jsonFormat1(RelatedStories.apply)
+  implicit def resultsFormat = jsonFormat2(Results.apply)
+  implicit def responseDataFormat = jsonFormat2(ResponseData.apply)
+  implicit def googleResponseFormat = jsonFormat3(GoogleResponse.apply)
 }
 
 class HttpService(implicit system: ActorSystem) {
@@ -42,6 +58,8 @@ class HttpService(implicit system: ActorSystem) {
 
   val host = "127.0.0.1"
   val port = 8080
+  val linkPattern = Uri("https://ajax.googleapis.com/ajax/services/search/news")
+  val version = Array(("v", "1.0"))
 
   val route: Route = {
     pathPrefix("analyzenews") {
@@ -50,13 +68,23 @@ class HttpService(implicit system: ActorSystem) {
           println(request)
           val splits = request.news.map(q => (q.query.split(" ").map(str => ("q", str)), q.n))
           val listOfFutures = splits.map { pair =>
-            val link = Uri("https://ajax.googleapis.com/ajax/services/search/news?v=1.0").withQuery(pair._1 :+("v", "1.0"): _*)
-            println(link)
-            Http().singleRequest(HttpRequest(GET, link))
-              .flatMap(response => Unmarshal(response.entity).to[String])
-              .map(println)
+            val numberOfRequests = pair._2 / 8
+            val tailrequest = pair._2 - numberOfRequests
+
+            val f = List.fill(numberOfRequests)(8).::(tailrequest).map{num =>
+              val link = linkPattern.withQuery(version ++ pair._1 :+ ("rsz", num.toString): _*)
+              println(link)
+              Http().singleRequest(HttpRequest(GET, link))
+                .flatMap(response => Unmarshal(response.entity.withContentType(ContentTypes.`application/json`)).to[GoogleResponse])
+                .recover{case x: Throwable => x.getLocalizedMessage}
+            }
+            f
           }
-          Future.sequence(listOfFutures)
+          Future.sequence(listOfFutures).map{ x =>
+            println(x)
+            x.mkString
+          }
+
 
           StatusCodes.OK
         }
@@ -72,6 +100,10 @@ class HttpService(implicit system: ActorSystem) {
 
 object Testing extends App {
   implicit val system = ActorSystem("test-system", ConfigFactory.parseString( """
+                                                                                |akka {
+                                                                                |  loggers = ["akka.event.Logging$DefaultLogger"]
+                                                                                |  loglevel = "DEBUG"
+                                                                                |}
                                                                               """.stripMargin))
   new HttpService()
 }
